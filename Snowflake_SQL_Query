@@ -1,0 +1,283 @@
+-- CTE: VW_TRANSACTIONS
+WITH VW_TRANSACTIONS AS (
+    -- Select the latest contact balance for each contact
+    SELECT
+        CONTACT_BALANCES1.ID,
+        NULL AS DEBT_ID,  -- No debt ID for balance records
+        NULL AS OFFER_ID, -- No offer ID for balance records
+        CONTACT_BALANCES1.CONTACT_ID,
+        CURRENT_DATE() AS PROCESS_DATE, -- Current date as the process date
+        'Current Balance' AS TRANSACTION_TYPE, -- Labeling as 'Current Balance'
+        NULL AS SUB_TYPE,
+        'In Savings' AS MEMO,
+        CONTACT_BALANCES1.PENDING AS AMOUNT, -- Amount is the pending balance
+        'Open' AS STATUS
+    FROM DPP_DATA.READER.CONTACT_BALANCES AS CONTACT_BALANCES1
+    JOIN DPP_DATA.READER.CONTACTS AS CONTACTS1
+        ON CONTACTS1.ID = CONTACT_BALANCES1.CONTACT_ID
+    WHERE CONTACTS1.ENROLLED = 1 -- Only include enrolled contacts
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY CONTACT_BALANCES1.CONTACT_ID
+        ORDER BY CONTACT_BALANCES1.STAMP DESC
+    ) = 1 -- Get the most recent balance per contact
+
+    UNION ALL
+
+    -- Select transaction data
+    SELECT
+        TRANSACTIONS1.ID,
+        -- Determine DEBT_ID based on transaction type
+        CASE
+            WHEN TRANSACTION_TYPES1.TITLE IN ('Settlement Payment', 'Earned Performance Fee') THEN
+                COALESCE(SETTLEMENTS2.DEBT_ID, SETTLEMENT_OFFERS2.DEBT_ID, 0)
+            ELSE NULL
+        END AS DEBT_ID,
+        -- Determine OFFER_ID based on transaction type
+        CASE
+            WHEN TRANSACTION_TYPES1.TITLE IN ('Settlement Payment', 'Earned Performance Fee') THEN
+                COALESCE(SETTLEMENTS2.OFFER_ID, SETTLEMENT_OFFERS2.ID, 0)
+            ELSE NULL
+        END AS OFFER_ID,
+        TRANSACTIONS1.CONTACT_ID,
+        TRANSACTIONS1.PROCESS_DATE,
+        TRANSACTION_TYPES1.TITLE AS TRANSACTION_TYPE, -- Get the transaction type title
+        TRANSACTION_SUBTYPES1.TITLE AS SUB_TYPE,      -- Get the transaction subtype title
+        TRANSACTIONS1.MEMO,
+        -- Adjust amount based on INOUT field
+        CASE
+            WHEN TRANSACTION_TYPES1.INOUT = 'O' THEN -TRANSACTIONS1.AMOUNT
+            ELSE TRANSACTIONS1.AMOUNT
+        END AS AMOUNT,
+        TRANSACTION_STATUSES1.NAME AS STATUS
+    FROM DPP_DATA.READER.TRANSACTIONS AS TRANSACTIONS1
+    -- Join to get transaction type details
+    LEFT JOIN DPP_DATA.READER.TRANSACTION_TYPES AS TRANSACTION_TYPES1
+        ON TRANSACTION_TYPES1.TRANS_TYPE = TRANSACTIONS1.TRANS_TYPE
+    -- Join to get transaction subtype details
+    LEFT JOIN DPP_DATA.READER.TRANSACTION_SUBTYPES AS TRANSACTION_SUBTYPES1
+        ON TRANSACTION_SUBTYPES1.ID = TRANSACTIONS1.SUB_TYPE
+    -- Join to get transaction status details
+    LEFT JOIN DPP_DATA.READER.TRANSACTION_STATUSES AS TRANSACTION_STATUSES1
+        ON TRANSACTION_STATUSES1.ID = TRANSACTIONS1.STATUS
+    -- Join to get settlement details for specific transaction types
+    LEFT JOIN (
+        SELECT DISTINCT
+            SETTLEMENTS1.TRANS_ID,
+            SETTLEMENTS1.OFFER_ID,
+            SETTLEMENT_OFFERS1.DEBT_ID
+        FROM DPP_DATA.READER.SETTLEMENTS AS SETTLEMENTS1
+        LEFT JOIN DPP_DATA.READER.SETTLEMENT_OFFERS AS SETTLEMENT_OFFERS1
+            ON SETTLEMENT_OFFERS1.ID = SETTLEMENTS1.OFFER_ID
+    ) AS SETTLEMENTS2
+        ON SETTLEMENTS2.TRANS_ID = TRANSACTIONS1.LINKED_TO
+    -- Join to get settlement offer details
+    LEFT JOIN DPP_DATA.READER.SETTLEMENT_OFFERS AS SETTLEMENT_OFFERS2
+        ON SETTLEMENT_OFFERS2.ID = TRANSACTIONS1.LINKED_TO
+    -- Join to ensure contact is enrolled
+    JOIN DPP_DATA.READER.CONTACTS AS CONTACTS1
+        ON CONTACTS1.ID = TRANSACTIONS1.CONTACT_ID
+    WHERE
+        CONTACTS1.ENROLLED = 1 -- Only include enrolled contacts
+        AND TRANSACTION_STATUSES1.NAME IN ('Low_Balance', 'Open') -- Filter by status
+        AND TRANSACTIONS1._FIVETRAN_DELETED = FALSE -- Exclude deleted records
+        AND TRANSACTIONS1.ACTIVE = 1 -- Only active transactions
+        AND TRANSACTIONS1.PROCESS_DATE >= CURRENT_DATE() -- Transactions from today onwards
+),
+-- CTE: VW_CORRECTED_TRANSACTIONS
+VW_CORRECTED_TRANSACTIONS AS (
+    SELECT
+        DATE_TRUNC('month', PROCESS_DATE) AS MONTH_OF, -- Truncate date to month
+        -- Assign priority based on transaction type
+        CASE TRANSACTION_TYPE
+            WHEN 'Current Balance' THEN 1
+            WHEN 'ACH Client Debit' THEN 2
+            WHEN 'Client Check Payment' THEN 3
+            WHEN 'Client Refund' THEN 4
+            WHEN 'FORTH Custodial Fee' THEN 5
+            WHEN 'Settlement Payment' THEN 6
+            WHEN 'Disbursement Fee' THEN 7
+            WHEN 'Earned Performance Fee' THEN 8
+            WHEN 'ACH Credit / Fee' THEN 9
+            ELSE NULL
+        END AS PRIORITY,
+        VW_TRANSACTIONS.*,
+        -- Calculate cumulative sum of amounts per contact
+        SUM(AMOUNT) OVER (
+            PARTITION BY VW_TRANSACTIONS.CONTACT_ID
+            ORDER BY VW_TRANSACTIONS.PROCESS_DATE,
+                -- Order by priority within the same date
+                CASE VW_TRANSACTIONS.TRANSACTION_TYPE
+                    WHEN 'Current Balance' THEN 1
+                    WHEN 'ACH Client Debit' THEN 2
+                    WHEN 'Client Check Payment' THEN 3
+                    WHEN 'Client Refund' THEN 4
+                    WHEN 'FORTH Custodial Fee' THEN 5
+                    WHEN 'Settlement Payment' THEN 6
+                    WHEN 'Disbursement Fee' THEN 7
+                    WHEN 'Earned Performance Fee' THEN 8
+                    WHEN 'ACH Credit / Fee' THEN 9
+                    ELSE NULL
+                END
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS CUMULATIVE_SUM
+    FROM VW_TRANSACTIONS
+),
+-- CTE: VW_AGG_TRANSACTIONS
+VW_AGG_TRANSACTIONS AS (
+    SELECT DISTINCT
+        MONTH_OF,
+        -- Get the maximum month for each contact
+        MAX(MONTH_OF) OVER (PARTITION BY CONTACT_ID) AS MAX_MONTH_OF,
+        CONTACT_ID,
+        -- Get the minimum cumulative sum (balance) per month per contact
+        MIN(CUMULATIVE_SUM) OVER (PARTITION BY MONTH_OF, CONTACT_ID) AS MIN_BALANCE
+    FROM VW_CORRECTED_TRANSACTIONS
+),
+-- CTE: PAYMENT_CAPABILITIES
+PAYMENT_CAPABILITIES AS (
+    SELECT
+        CONTACT_ID,
+        -- Calculate one-time payment capability
+        MIN(MIN_BALANCE) OVER (PARTITION BY CONTACT_ID) - 
+            ((DATEDIFF('month', CURRENT_DATE(), MAX_MONTH_OF) + 1) * 10.95) AS ONE_PAY,
+        -- Calculate three-payment capability
+        MIN(CASE WHEN MONTH_OF > DATEADD('month', 2, DATE_TRUNC('month', CURRENT_DATE()))
+            THEN MIN_BALANCE END) OVER (PARTITION BY CONTACT_ID) - 
+            ((DATEDIFF('month', CURRENT_DATE(), MAX_MONTH_OF) + 1) * 10.95) AS THREE_PAYS,
+        -- Calculate six-payment capability
+        MIN(CASE WHEN MONTH_OF > DATEADD('month', 5, DATE_TRUNC('month', CURRENT_DATE()))
+            THEN MIN_BALANCE END) OVER (PARTITION BY CONTACT_ID) - 
+            ((DATEDIFF('month', CURRENT_DATE(), MAX_MONTH_OF) + 1) * 10.95) AS SIX_PAYS,
+        -- Calculate nine-payment capability
+        MIN(CASE WHEN MONTH_OF > DATEADD('month', 8, DATE_TRUNC('month', CURRENT_DATE()))
+            THEN MIN_BALANCE END) OVER (PARTITION BY CONTACT_ID) - 
+            ((DATEDIFF('month', CURRENT_DATE(), MAX_MONTH_OF) + 1) * 10.95) AS NINE_PAYS,
+        -- Calculate twelve-payment capability
+        MIN(CASE WHEN MONTH_OF > DATEADD('month', 11, DATE_TRUNC('month', CURRENT_DATE()))
+            THEN MIN_BALANCE END) OVER (PARTITION BY CONTACT_ID) - 
+            ((DATEDIFF('month', CURRENT_DATE(), MAX_MONTH_OF) + 1) * 10.95) AS TWELVE_PAYS
+    FROM VW_AGG_TRANSACTIONS
+)
+-- Final SELECT Statement
+SELECT
+    CONTACTS_USERFIELDS1.TRAUNCH_DATE,
+    DEBTS1.ID AS DEBT_ID,
+    CONTACTS2.ACTIVE_CONTACT,
+    CONTACTS2.ENROLLED_DATE AS CONTACT_ENROLLED_DATE,
+    ADD_MONTHS(CONTACTS2.ENROLLED_DATE, 6) AS READY_TO_SETTLE_DATE_SIX, -- Date after 6 months of enrollment
+    ADD_MONTHS(CONTACTS2.ENROLLED_DATE, 9) AS READY_TO_SETTLE_DATE_NINE, -- Date after 9 months of enrollment
+    DEBTS1.CONTACT_ID,
+    CONTACTS2.CONTACT_NAME,
+    USERS_ASSIGNMENT_NG1.NG, -- Negotiator assigned to the contact
+    USERS_ASSIGNMENT_PNG1.PNG, -- Priority Negotiator assigned to the contact
+    DEBTS1.WHOS_DEBT,
+    ENROLLMENT_PLAN1.FEE1_PERCENT, -- Fee percentage from enrollment plan
+    UPPER(CREDITORS_ORIGINAL1.COMPANY) AS ORIGINAL_CREDITOR,
+    DEBTS1.ORIGINAL_DEBT_AMOUNT,
+    UPPER(CREDITORS_DEBT_BUYER1.COMPANY) AS DEBT_BUYER,
+    DEBTS1.CURRENT_AMOUNT,
+    RIGHT(DEBTS1.ACCOUNT_NUM, 4) AS LAST_FOUR, -- Last four digits of account number
+    -- Determine who currently holds the debt
+    COALESCE(NULLIF(UPPER(CREDITORS_DEBT_BUYER1.COMPANY), ''), UPPER(CREDITORS_ORIGINAL1.COMPANY)) AS CURRENTLY_WITH,
+    DEBTS1.HAS_SUMMONS,
+    DEBTS1.SETTLED,
+    DEBTS1.SETTLEMENT_AMOUNT,
+    -- Estimate settlement amount based on whether there's a summons
+    (CASE WHEN DEBTS1.HAS_SUMMONS THEN 1 ELSE 0.55 END) * DEBTS1.CURRENT_AMOUNT AS EST_SETTLEMENT_AMT,
+    -- Estimate earned performance fee
+    ENROLLMENT_PLAN1.FEE1_PERCENT * DEBTS1.ORIGINAL_DEBT_AMOUNT AS EST_EPF,
+    -- Total amount needed for settlement
+    ((CASE WHEN DEBTS1.HAS_SUMMONS THEN 1 ELSE 0.55 END) * DEBTS1.CURRENT_AMOUNT) + 
+        (ENROLLMENT_PLAN1.FEE1_PERCENT * DEBTS1.ORIGINAL_DEBT_AMOUNT) AS AMT_NEEDED,
+    CONTACTS2.CONTACT_STATUS,
+    -- Determine if one-time payment is possible
+    (PAYMENT_CAPABILITIES.ONE_PAY - (AMT_NEEDED + 5)) > 0 AS ONE_PAYMENT,
+    -- Determine if three payments are possible
+    (COALESCE(PAYMENT_CAPABILITIES.THREE_PAYS, PAYMENT_CAPABILITIES.ONE_PAY) - (AMT_NEEDED + 15)) > 0 AS THREE_PAYMENTS,
+    -- Determine if six payments are possible
+    (COALESCE(PAYMENT_CAPABILITIES.SIX_PAYS, PAYMENT_CAPABILITIES.THREE_PAYS, PAYMENT_CAPABILITIES.ONE_PAY) - (AMT_NEEDED + 30)) > 0 AS SIX_PAYMENTS,
+    -- Determine if nine payments are possible
+    (COALESCE(PAYMENT_CAPABILITIES.NINE_PAYS, PAYMENT_CAPABILITIES.SIX_PAYS, PAYMENT_CAPABILITIES.THREE_PAYS, PAYMENT_CAPABILITIES.ONE_PAY) - (AMT_NEEDED + 50)) > 0 AS NINE_PAYMENTS,
+    -- Determine if twelve payments are possible
+    (COALESCE(PAYMENT_CAPABILITIES.TWELVE_PAYS, PAYMENT_CAPABILITIES.NINE_PAYS, PAYMENT_CAPABILITIES.SIX_PAYS, PAYMENT_CAPABILITIES.THREE_PAYS, PAYMENT_CAPABILITIES.ONE_PAY) - (AMT_NEEDED + 60)) > 0 AS TWELVE_PAYMENTS
+FROM DPP_DATA.READER.DEBTS AS DEBTS1
+-- Join to get original creditor details
+LEFT JOIN DPP_DATA.READER.CREDITORS AS CREDITORS_ORIGINAL1
+    ON CREDITORS_ORIGINAL1.ID = DEBTS1.CREDITOR_ID
+-- Join to get debt buyer details
+LEFT JOIN DPP_DATA.READER.CREDITORS AS CREDITORS_DEBT_BUYER1
+    ON CREDITORS_DEBT_BUYER1.ID = DEBTS1.DEBT_BUYER
+-- Subquery to get contact details
+JOIN (
+    SELECT
+        CONTACTS1.ID,
+        CONTACTS1.ENROLLED AS ACTIVE_CONTACT,
+        CONTACTS1.ENROLLED_DATE,
+        UPPER(CONCAT(CONTACTS1.FIRSTNAME, ' ', CONTACTS1.LASTNAME)) AS CONTACT_NAME,
+        CONTACTS_LEAD_STATUS1.TITLE AS CONTACT_STATUS
+    FROM DPP_DATA.READER.CONTACTS AS CONTACTS1
+    -- Join to get contact status title
+    LEFT JOIN DPP_DATA.READER.CONTACTS_LEAD_STATUS AS CONTACTS_LEAD_STATUS1
+        ON CONTACTS_LEAD_STATUS1.ID = CONTACTS1.LEADSTATUS
+    WHERE CONTACTS1.ENROLLED = 1 -- Only include enrolled contacts
+    
+) AS CONTACTS2
+    ON CONTACTS2.ID = DEBTS1.CONTACT_ID
+-- Left join to get assigned negotiator
+LEFT JOIN (
+    SELECT
+        USERS_ASSIGNMENT1.CONTACT_ID,
+        UPPER(CONCAT(USERS1.FIRSTNAME, ' ', USERS1.LASTNAME)) AS NG
+    FROM DPP_DATA.READER.USERS_ASSIGNMENT AS USERS_ASSIGNMENT1
+    JOIN DPP_DATA.READER.USERS AS USERS1
+        ON USERS1.UID = USERS_ASSIGNMENT1.USER_ID
+    JOIN DPP_DATA.READER.USERS_ROLES AS USERS_ROLES1
+        ON USERS_ROLES1.ID = USERS1.ROLE
+    WHERE USERS_ROLES1.NAME = 'Negotiator'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY USERS_ASSIGNMENT1.CONTACT_ID
+        ORDER BY USERS_ASSIGNMENT1._FIVETRAN_SYNCED DESC
+    ) = 1 -- Get the most recent assignment per contact
+) AS USERS_ASSIGNMENT_NG1
+    ON USERS_ASSIGNMENT_NG1.CONTACT_ID = DEBTS1.CONTACT_ID
+-- Left join to get assigned priority negotiator
+LEFT JOIN (
+    SELECT
+        USERS_ASSIGNMENT1.CONTACT_ID,
+        UPPER(CONCAT(USERS1.FIRSTNAME, ' ', USERS1.LASTNAME)) AS PNG
+    FROM DPP_DATA.READER.USERS_ASSIGNMENT AS USERS_ASSIGNMENT1
+    JOIN DPP_DATA.READER.USERS AS USERS1
+        ON USERS1.UID = USERS_ASSIGNMENT1.USER_ID
+    JOIN DPP_DATA.READER.USERS_ROLES AS USERS_ROLES1
+        ON USERS_ROLES1.ID = USERS1.ROLE
+    WHERE USERS_ROLES1.NAME = 'Priority Negotiator'
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY USERS_ASSIGNMENT1.CONTACT_ID
+        ORDER BY USERS_ASSIGNMENT1._FIVETRAN_SYNCED DESC
+    ) = 1 -- Get the most recent assignment per contact
+) AS USERS_ASSIGNMENT_PNG1
+    ON USERS_ASSIGNMENT_PNG1.CONTACT_ID = DEBTS1.CONTACT_ID
+-- Left join to get enrollment plan details
+LEFT JOIN (
+    SELECT
+        ENROLLMENT_PLAN1.CONTACT_ID,
+        -- Extract fee percentage from FEE1 field
+        TRY_TO_NUMERIC(REPLACE(SPLIT(ENROLLMENT_PLAN1.FEE1, ',')[3], '"', '')) / 100 AS FEE1_PERCENT
+    FROM DPP_DATA.READER.ENROLLMENT_PLAN AS ENROLLMENT_PLAN1
+) AS ENROLLMENT_PLAN1
+    ON ENROLLMENT_PLAN1.CONTACT_ID = DEBTS1.CONTACT_ID
+-- Left join to get payment capabilities
+LEFT JOIN PAYMENT_CAPABILITIES
+    ON PAYMENT_CAPABILITIES.CONTACT_ID = DEBTS1.CONTACT_ID
+-- Adding the traunch/investment month
+LEFT JOIN(
+    SELECT CUSTOM_ID, CONTACT_ID AS CONTACT_ID1, F_DATE AS TRAUNCH_DATE
+    FROM DPP_DATA.READER.CONTACTS_USERFIELDS
+    WHERE CUSTOM_ID = 527221
+) AS CONTACTS_USERFIELDS1 ON CONTACT_ID1 = DEBTS1.CONTACT_ID
+
+WHERE CONTACTS2.ACTIVE_CONTACT = 1 AND DEBTS1.SETTLED = 0
+QUALIFY ROW_NUMBER() OVER (PARTITION BY DEBT_ID ORDER BY DEBT_ID DESC) = 1
+
+; -- Only include active contacts
+
